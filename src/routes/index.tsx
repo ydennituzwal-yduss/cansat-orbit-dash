@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Panel } from "@/components/gcs/Panel";
 import { TelemetryCard } from "@/components/gcs/TelemetryCard";
 import { MiniChart } from "@/components/gcs/MiniChart";
@@ -7,8 +7,10 @@ import { MapPanel } from "@/components/gcs/MapPanel";
 import { ErrorPanel } from "@/components/gcs/ErrorPanel";
 import { AttitudeIndicator } from "@/components/gcs/AttitudeIndicator";
 import { CameraPanel } from "@/components/gcs/CameraPanel";
-import { MissionLog, type LogEntry } from "@/components/gcs/MissionLog";
+import { MissionLog } from "@/components/gcs/MissionLog";
 import { MissionControls } from "@/components/gcs/MissionControls";
+import { MissionTimeline } from "@/components/gcs/MissionTimeline";
+import { useMissionSimulation } from "@/lib/missionSimulation";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -30,30 +32,27 @@ const statusStyles: Record<MissionStatus, string> = {
   CRITICAL: "text-critical border-critical/40 bg-critical/10",
 };
 
-const seed = (base: number, amp: number, n = 40) =>
-  Array.from({ length: n }, (_, i) => base + Math.sin(i / 3) * amp + Math.cos(i / 5) * amp * 0.4);
-
 function HeaderButton({
   children,
   variant = "default",
   onClick,
+  disabled,
 }: {
   children: React.ReactNode;
   variant?: "default" | "primary" | "danger";
   onClick?: () => void;
+  disabled?: boolean;
 }) {
   const styles = {
-    default:
-      "border-border bg-panel/70 text-foreground hover:bg-panel hover:border-cyan-glow/50",
-    primary:
-      "border-cyan-glow/50 bg-cyan-glow/10 text-cyan-glow hover:bg-cyan-glow/20",
-    danger:
-      "border-critical/50 bg-critical/10 text-critical hover:bg-critical/20",
+    default: "border-border bg-panel/70 text-foreground hover:bg-panel hover:border-cyan-glow/50",
+    primary: "border-cyan-glow/50 bg-cyan-glow/10 text-cyan-glow hover:bg-cyan-glow/20",
+    danger: "border-critical/50 bg-critical/10 text-critical hover:bg-critical/20",
   }[variant];
   return (
     <button
       onClick={onClick}
-      className={`rounded border px-2.5 py-1.5 font-mono text-[0.65rem] uppercase tracking-wider transition-colors ${styles}`}
+      disabled={disabled}
+      className={`rounded border px-2.5 py-1.5 font-mono text-[0.65rem] uppercase tracking-wider transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${styles}`}
     >
       {children}
     </button>
@@ -67,50 +66,89 @@ function fmtTime(s: number) {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
+function downloadCSV(rows: string[][], name: string) {
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function GCS() {
-  const [missionTime, setMissionTime] = useState(0);
-  const [utcNow, setUtcNow] = useState(new Date());
-  const [status] = useState<MissionStatus>("NOMINAL");
-  const [connected] = useState(false);
+  const sim = useMissionSimulation();
+  const [mounted, setMounted] = useState(false);
+  const [utcStr, setUtcStr] = useState("");
 
   useEffect(() => {
-    const i = setInterval(() => {
-      setMissionTime((t) => t + 1);
-      setUtcNow(new Date());
-    }, 1000);
+    setMounted(true);
+    const tick = () => setUtcStr(new Date().toISOString().slice(11, 19) + "Z");
+    tick();
+    const i = setInterval(tick, 1000);
     return () => clearInterval(i);
   }, []);
 
-  const [logs, setLogs] = useState<LogEntry[]>([
-    { t: "T+00:00:00", level: "INFO", msg: "Ground Control Software initialized" },
-    { t: "T+00:00:02", level: "OK", msg: "Telemetry link established · 9600 baud" },
-    { t: "T+00:00:12", level: "INFO", msg: "Mission state: PRE-LAUNCH" },
-    { t: "T+00:00:34", level: "OK", msg: "GPS fix acquired · 12 satellites" },
-    { t: "T+00:01:05", level: "INFO", msg: "Altitude crossed 50m" },
-    { t: "T+00:01:42", level: "WARN", msg: "Apogee detected · descent rate within nominal" },
-    { t: "T+00:02:18", level: "OK", msg: "Payload separation executed" },
-    { t: "T+00:03:55", level: "OK", msg: "Landing detected · recovery in progress" },
-  ]);
+  const { last, phase, history, logs, errorCode, path, satellites, gpsState, servoActivated } = sim;
+  const altitude = last?.altitude ?? 0;
+  const temperature = last?.temperature ?? 0;
+  const pressure = last?.pressure ?? 0;
+  const battery = last?.battery ?? 0;
+  const descentRate = last?.descentRate ?? 0;
+  const velocity = last?.velocity ?? 0;
+  const lat = last?.lat ?? 28.5728;
+  const lon = last?.lon ?? 77.3255;
 
-  const charts = useMemo(
-    () => ({
-      altitude: seed(220, 60),
-      temperature: seed(24, 3),
-      pressure: seed(1012, 6),
-      battery: seed(7.4, 0.1),
-      descent: seed(6, 2),
-    }),
-    []
-  );
+  const status: MissionStatus =
+    errorCode !== "0000"
+      ? "CRITICAL"
+      : phase === "APOGEE" || phase === "SEPARATION" || phase === "DESCENT"
+        ? "WARNING"
+        : "NOMINAL";
+
+  const altSeries = history.map((h) => h.altitude);
+  const tempSeries = history.map((h) => h.temperature);
+  const pressSeries = history.map((h) => h.pressure);
+  const battSeries = history.map((h) => h.battery);
+  const descSeries = history.map((h) => h.descentRate);
+  const velSeries = history.map((h) => h.velocity);
+
+  const exportCSV = () => {
+    const header = ["t", "phase", "altitude_m", "temp_c", "pressure_hpa", "battery_v", "velocity_mps", "descent_mps", "lat", "lon", "roll", "pitch", "yaw"];
+    const rows = history.map((h) => [
+      h.t, h.phase, h.altitude.toFixed(2), h.temperature.toFixed(2), h.pressure.toFixed(2),
+      h.battery.toFixed(2), h.velocity.toFixed(2), h.descentRate.toFixed(2),
+      h.lat.toFixed(6), h.lon.toFixed(6), h.roll.toFixed(2), h.pitch.toFixed(2), h.yaw.toFixed(2),
+    ].map(String));
+    downloadCSV([header, ...rows], `cansat-telemetry-${Date.now()}.csv`);
+  };
+
+  const exportGraph = () => {
+    const canvases = Array.from(document.querySelectorAll("canvas")) as HTMLCanvasElement[];
+    if (!canvases.length) return;
+    canvases.forEach((c, i) => {
+      c.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `cansat-graph-${i + 1}.png`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    });
+  };
 
   const onExec = (cmd: string) => {
-    const t = `T+${fmtTime(missionTime)}`;
-    setLogs((l) => [...l, { t, level: "CRIT", msg: `Command executed: ${cmd.toUpperCase()}` }]);
+    if (cmd === "Manual Separation") sim.manualSeparation();
+    else if (cmd === "Deploy Emergency Parachute") sim.deployEmergencyChute();
+    else if (cmd === "Redundant Activation") sim.redundantActivation();
+    else if (cmd === "Reset Mission") sim.reset();
   };
 
   return (
     <div className="min-h-screen text-foreground">
-      {/* HEADER */}
       <header className="sticky top-0 z-50 border-b border-border bg-background/85 backdrop-blur-md">
         <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5">
           <div className="flex items-center gap-4">
@@ -131,101 +169,101 @@ function GCS() {
               <span className="status-dot animate-pulse-glow" />
               {status}
             </div>
+            <div className="hidden rounded border border-cyan-glow/30 bg-cyan-glow/5 px-2.5 py-1 font-mono text-[0.65rem] uppercase tracking-widest text-cyan-glow lg:block">
+              Phase · {phase}
+            </div>
           </div>
 
           <div className="flex items-center gap-4">
             <div className="hidden text-right font-mono md:block">
               <div className="text-[0.55rem] uppercase tracking-widest text-muted-foreground">MET / UTC</div>
-              <div className="text-sm tabular-nums text-cyan-glow">
-                T+{fmtTime(missionTime)} · {utcNow.toISOString().slice(11, 19)}Z
+              <div className="text-sm tabular-nums text-cyan-glow" suppressHydrationWarning>
+                T+{fmtTime(sim.t)} · {mounted ? utcStr : "--:--:--Z"}
               </div>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              <HeaderButton variant="primary">▶ Start Telemetry</HeaderButton>
-              <HeaderButton variant="danger">■ Stop Telemetry</HeaderButton>
-              <HeaderButton>Export CSV</HeaderButton>
-              <HeaderButton>Export Graph</HeaderButton>
-              <HeaderButton>Sync Time</HeaderButton>
-              <HeaderButton>Reset Packets</HeaderButton>
+              <HeaderButton variant="primary" onClick={sim.start} disabled={sim.running}>
+                ▶ Start Telemetry
+              </HeaderButton>
+              <HeaderButton variant="danger" onClick={sim.stop} disabled={!sim.running}>
+                ■ Stop Telemetry
+              </HeaderButton>
+              <HeaderButton onClick={exportCSV}>Export CSV</HeaderButton>
+              <HeaderButton onClick={exportGraph}>Export Graph</HeaderButton>
+              <HeaderButton onClick={sim.clearErrors}>Clear Errors</HeaderButton>
+              <HeaderButton onClick={sim.reset}>Reset Packets</HeaderButton>
             </div>
           </div>
         </div>
       </header>
 
-      {/* GRID */}
       <main className="grid grid-cols-12 gap-3 p-3">
-        {/* Telemetry */}
         <Panel
           title="Telemetry · Live Packet"
-          status="STREAMING"
-          statusColor="nominal"
-          right={<span className="font-mono text-[0.6rem] text-muted-foreground">PKT 0142</span>}
+          status={sim.running ? "STREAMING" : "STANDBY"}
+          statusColor={sim.running ? "nominal" : "muted"}
+          right={<span className="font-mono text-[0.6rem] text-muted-foreground">PKT {String(sim.t).padStart(4, "0")}</span>}
           className="col-span-12 xl:col-span-8"
         >
           <div className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-3 lg:grid-cols-5">
-            <TelemetryCard label="Altitude" value="248.6" unit="m" trend="up" />
-            <TelemetryCard label="Temperature" value="24.3" unit="°C" />
-            <TelemetryCard label="Pressure" value="982.4" unit="hPa" trend="down" />
-            <TelemetryCard label="Battery" value="7.42" unit="V" status="warning" />
-            <TelemetryCard label="Packet Count" value="0142" />
-            <TelemetryCard label="Latitude" value="28.5733° N" />
-            <TelemetryCard label="Longitude" value="77.3263° E" />
-            <TelemetryCard label="Mission State" value="DESCENT" />
+            <TelemetryCard label="Altitude" value={altitude.toFixed(1)} unit="m" trend={velocity > 0.1 ? (phase === "DESCENT" || phase === "LANDED" ? "down" : "up") : "flat"} />
+            <TelemetryCard label="Temperature" value={temperature.toFixed(1)} unit="°C" />
+            <TelemetryCard label="Pressure" value={pressure.toFixed(1)} unit="hPa" trend={phase === "ASCENT" ? "down" : phase === "DESCENT" ? "up" : "flat"} />
+            <TelemetryCard label="Battery" value={battery.toFixed(2)} unit="V" status={battery < 7.0 ? "warning" : "nominal"} />
+            <TelemetryCard label="Packet Count" value={String(sim.t).padStart(4, "0")} />
+            <TelemetryCard label="Latitude" value={`${lat.toFixed(5)}° N`} />
+            <TelemetryCard label="Longitude" value={`${lon.toFixed(5)}° E`} />
+            <TelemetryCard label="Mission State" value={phase} />
             <TelemetryCard label="Team ID" value="2024-CSP-014" />
-            <TelemetryCard label="Descent Rate" value="6.2" unit="m/s" />
+            <TelemetryCard label="Descent Rate" value={descentRate.toFixed(1)} unit="m/s" />
           </div>
         </Panel>
 
-        {/* Error */}
         <Panel
           title="Error Monitor"
-          status="NOMINAL"
-          statusColor="nominal"
+          status={errorCode === "0000" ? "NOMINAL" : "FAULT"}
+          statusColor={errorCode === "0000" ? "nominal" : "critical"}
           className="col-span-12 xl:col-span-4"
         >
-          <ErrorPanel code="0000" />
+          <ErrorPanel code={errorCode} />
         </Panel>
 
-        {/* Map */}
         <Panel
           title="GPS · Live Tracking"
-          status="3D FIX"
-          statusColor="nominal"
+          status={gpsState}
+          statusColor={gpsState === "3D FIX" ? "nominal" : gpsState === "2D FIX" ? "warning" : "muted"}
           right={<span className="font-mono text-[0.6rem] text-muted-foreground">OSM · CARTO DARK</span>}
           className="col-span-12 xl:col-span-8 h-[460px]"
           contentClassName="relative"
         >
-          <MapPanel />
+          <MapPanel path={path} current={[lat, lon]} />
         </Panel>
 
-        {/* Attitude */}
         <Panel
           title="Orientation · IMU"
           status="STABLE"
           statusColor="nominal"
           className="col-span-12 md:col-span-6 xl:col-span-4"
         >
-          <AttitudeIndicator roll={-8.4} pitch={3.2} yaw={142.7} />
+          <AttitudeIndicator roll={last?.roll ?? 0} pitch={last?.pitch ?? 0} yaw={last?.yaw ?? 0} />
         </Panel>
 
-        {/* Charts */}
         <Panel
           title="Real-Time Graphs"
-          status="LIVE"
-          statusColor="nominal"
+          status={sim.running ? "LIVE" : "STANDBY"}
+          statusColor={sim.running ? "nominal" : "muted"}
           className="col-span-12 xl:col-span-8"
         >
           <div className="grid grid-cols-1 gap-2 p-3 sm:grid-cols-2 lg:grid-cols-3">
-            <MiniChart label="Altitude vs Time" unit="m" color="#22d3ee" data={charts.altitude} />
-            <MiniChart label="Temperature vs Time" unit="°C" color="#fbbf24" data={charts.temperature} />
-            <MiniChart label="Pressure vs Time" unit="hPa" color="#60a5fa" data={charts.pressure} />
-            <MiniChart label="Battery vs Time" unit="V" color="#a78bfa" data={charts.battery} />
-            <MiniChart label="Descent Rate vs Time" unit="m/s" color="#34d399" data={charts.descent} />
-            <MiniChart label="Velocity vs Time" unit="m/s" color="#f472b6" data={seed(12, 4)} />
+            <MiniChart label="Altitude vs Time" unit="m" color="#22d3ee" data={altSeries} />
+            <MiniChart label="Temperature vs Time" unit="°C" color="#fbbf24" data={tempSeries} />
+            <MiniChart label="Pressure vs Time" unit="hPa" color="#60a5fa" data={pressSeries} />
+            <MiniChart label="Battery vs Time" unit="V" color="#a78bfa" data={battSeries} />
+            <MiniChart label="Descent Rate vs Time" unit="m/s" color="#34d399" data={descSeries} />
+            <MiniChart label="Velocity vs Time" unit="m/s" color="#f472b6" data={velSeries} />
           </div>
         </Panel>
 
-        {/* Camera */}
         <Panel
           title="Payload Camera"
           status="STANDBY"
@@ -235,7 +273,6 @@ function GCS() {
           <CameraPanel />
         </Panel>
 
-        {/* Event log */}
         <Panel
           title="Mission Event Log"
           status="RECORDING"
@@ -246,7 +283,6 @@ function GCS() {
           <MissionLog entries={logs} />
         </Panel>
 
-        {/* Controls */}
         <Panel
           title="Mission Control · Commands"
           status="ARMED"
@@ -256,22 +292,30 @@ function GCS() {
           <MissionControls onExecute={onExec} />
         </Panel>
 
-        {/* Subsystems */}
+        <Panel
+          title="Mission Timeline"
+          status={phase}
+          statusColor="nominal"
+          className="col-span-12 xl:col-span-4 h-[320px]"
+        >
+          <MissionTimeline current={phase} />
+        </Panel>
+
         <Panel
           title="Subsystem Status"
           status="NOMINAL"
           statusColor="nominal"
-          className="col-span-12 xl:col-span-4 h-[320px]"
+          className="col-span-12"
         >
-          <ul className="space-y-1.5 p-3 font-mono text-[0.7rem]">
+          <ul className="grid grid-cols-2 gap-1.5 p-3 font-mono text-[0.7rem] md:grid-cols-4">
             {[
-              { name: "Power Distribution", v: "OK", level: "ok" },
-              { name: "Radio Link (LoRa 433)", v: "-78 dBm", level: "ok" },
+              { name: "Power Distribution", v: battery > 7.0 ? "OK" : "LOW", level: battery > 7.0 ? "ok" : "warn" },
+              { name: "Radio Link (LoRa 433)", v: sim.running ? "-78 dBm" : "STANDBY", level: "ok" },
               { name: "IMU (MPU-9250)", v: "CALIBRATED", level: "ok" },
               { name: "Barometer (BMP280)", v: "OK", level: "ok" },
-              { name: "GPS Module (NEO-6M)", v: "3D FIX · 12 SAT", level: "ok" },
-              { name: "Servo (Separation)", v: "ARMED", level: "warn" },
-              { name: "SD Logger", v: "WRITING", level: "ok" },
+              { name: "GPS Module (NEO-6M)", v: `${gpsState} · ${satellites} SAT`, level: gpsState === "3D FIX" ? "ok" : gpsState === "2D FIX" ? "warn" : "crit" },
+              { name: "Servo (Separation)", v: servoActivated ? "ACTIVATED" : "ARMED", level: servoActivated ? "ok" : "warn" },
+              { name: "SD Logger", v: sim.running ? "WRITING" : "IDLE", level: "ok" },
               { name: "Thermal", v: "NOMINAL", level: "ok" },
             ].map((s) => (
               <li key={s.name} className="flex items-center justify-between gap-2 rounded border border-border bg-panel/40 px-2 py-1.5">
@@ -285,7 +329,6 @@ function GCS() {
         </Panel>
       </main>
 
-      {/* FOOTER */}
       <footer className="border-t border-border bg-background/85 px-4 py-2 font-mono text-[0.65rem] backdrop-blur">
         <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground">
           <div className="flex items-center gap-4">
@@ -294,9 +337,9 @@ function GCS() {
           </div>
           <div className="flex items-center gap-4">
             <span className="flex items-center gap-1.5">
-              <span className={`status-dot animate-pulse-glow ${connected ? "text-nominal" : "text-critical"}`} />
-              <span className={connected ? "text-nominal" : "text-critical"}>
-                {connected ? "CONNECTED" : "DISCONNECTED"}
+              <span className={`status-dot animate-pulse-glow ${sim.running ? "text-nominal" : "text-critical"}`} />
+              <span className={sim.running ? "text-nominal" : "text-critical"}>
+                {sim.running ? "TELEMETRY LIVE" : "DISCONNECTED"}
               </span>
             </span>
             <span>MQTT · STANDBY</span>
